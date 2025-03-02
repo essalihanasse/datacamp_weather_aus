@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import FunctionTransformer, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, StandardScaler, OneHotEncoder
 from sklearn.compose import make_column_transformer, ColumnTransformer
 from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -162,44 +162,68 @@ class LocationEncoder(BaseEstimator, TransformerMixin):
     
     def __init__(self):
         self.location_stats = {}
+        self.one_hot_encoder = None
     
     def fit(self, X, y=None):
-        if 'Location' in X.columns and y is not None:
-            # Calculate rain probability by location
-            location_stats = pd.DataFrame({
-                'rain_prob': X.groupby('Location')['RainToday_numeric'].mean(),
-                'temp_mean': X.groupby('Location')['MaxTemp'].mean(),
-                'humidity_mean': X.groupby('Location')['Humidity3pm'].mean() if 'Humidity3pm' in X.columns else None,
-                'pressure_mean': X.groupby('Location')['Pressure3pm'].mean() if 'Pressure3pm' in X.columns else None
-            })
+        if 'Location' in X.columns:
+            # For one-hot encoding
+            self.one_hot_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+            self.one_hot_encoder.fit(X[['Location']])
             
-            # Store for transform
-            self.location_stats = location_stats.to_dict(orient='index')
+            # For location stats
+            if 'RainToday_numeric' in X.columns:
+                # Calculate rain probability by location
+                rain_prob = X.groupby('Location')['RainToday_numeric'].mean()
+                self.location_stats['rain_prob'] = rain_prob.to_dict()
+            
+            if 'MaxTemp' in X.columns:
+                temp_mean = X.groupby('Location')['MaxTemp'].mean()
+                self.location_stats['temp_mean'] = temp_mean.to_dict()
+            
+            if 'Humidity3pm' in X.columns:
+                humidity_mean = X.groupby('Location')['Humidity3pm'].mean()
+                self.location_stats['humidity_mean'] = humidity_mean.to_dict()
+            
+            if 'Pressure3pm' in X.columns:
+                pressure_mean = X.groupby('Location')['Pressure3pm'].mean()
+                self.location_stats['pressure_mean'] = pressure_mean.to_dict()
         
         return self
     
     def transform(self, X):
         X_copy = X.copy()
         
-        if 'Location' in X_copy.columns and self.location_stats:
-            # Add location-based features
-            X_copy['location_rain_prob'] = X_copy['Location'].map(
-                {loc: stats.get('rain_prob', 0) for loc, stats in self.location_stats.items()}
-            ).fillna(0)
+        if 'Location' in X_copy.columns:
+            # Add location-based statistical features if we have stats
+            if 'rain_prob' in self.location_stats:
+                X_copy['location_rain_prob'] = X_copy['Location'].map(
+                    self.location_stats['rain_prob']
+                ).fillna(0)
             
-            X_copy['location_temp_mean'] = X_copy['Location'].map(
-                {loc: stats.get('temp_mean', 0) for loc, stats in self.location_stats.items()}
-            ).fillna(0)
+            if 'temp_mean' in self.location_stats:
+                X_copy['location_temp_mean'] = X_copy['Location'].map(
+                    self.location_stats['temp_mean']
+                ).fillna(0)
             
-            if 'humidity_mean' in next(iter(self.location_stats.values())):
+            if 'humidity_mean' in self.location_stats:
                 X_copy['location_humidity_mean'] = X_copy['Location'].map(
-                    {loc: stats.get('humidity_mean', 0) for loc, stats in self.location_stats.items()}
+                    self.location_stats['humidity_mean']
                 ).fillna(0)
             
-            if 'pressure_mean' in next(iter(self.location_stats.values())):
+            if 'pressure_mean' in self.location_stats:
                 X_copy['location_pressure_mean'] = X_copy['Location'].map(
-                    {loc: stats.get('pressure_mean', 0) for loc, stats in self.location_stats.items()}
+                    self.location_stats['pressure_mean']
                 ).fillna(0)
+            
+            # Add one-hot encoded columns if encoder is fitted
+            if self.one_hot_encoder is not None:
+                location_encoded = self.one_hot_encoder.transform(X_copy[['Location']])
+                location_df = pd.DataFrame(
+                    location_encoded,
+                    columns=[f"Location_{cat}" for cat in self.one_hot_encoder.categories_[0]],
+                    index=X_copy.index
+                )
+                X_copy = pd.concat([X_copy, location_df], axis=1)
             
             # Drop original location column
             X_copy = X_copy.drop('Location', axis=1)
@@ -283,24 +307,64 @@ transformer_severity = FunctionTransformer(
 )
 
 
+# Function for initial imputation
+def identify_and_impute(X, y=None):
+    """Impute missing values in numerical and categorical features."""
+    # Identify numerical and categorical columns
+    numerical_cols = X.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = X.select_dtypes(exclude=['number']).columns.tolist()
+    
+    # Create a copy to avoid modifying original
+    X_processed = X.copy()
+    
+    # Impute numerical values first (before feature engineering)
+    if numerical_cols:
+        numerical_imputer = SimpleImputer(strategy='median')
+        X_processed[numerical_cols] = numerical_imputer.fit_transform(X_processed[numerical_cols])
+    
+    # Impute categorical values 
+    if categorical_cols:
+        categorical_imputer = SimpleImputer(strategy='most_frequent')
+        X_processed[categorical_cols] = categorical_imputer.fit_transform(X_processed[categorical_cols])
+    
+    return X_processed
+
+
 def get_estimator():
-    """Return the model pipeline."""
+    """Return the model pipeline with fixed preprocessing for categorical features."""
+    
+    # Initial imputation transformer
+    initial_imputer = FunctionTransformer(identify_and_impute)
     
     # Create pre-processing steps with custom transformers
     preprocessing_pipeline = Pipeline([
+        ('initial_imputation', initial_imputer),
         ('temporal_features', TemporalFeatureExtractor()),
         ('weather_differentials', WeatherDifferentialExtractor()),
         ('rain_today_encoding', RainTodayEncoder()),
-        ('location_encoding', LocationEncoder()),
-        ('cyclical_encoding', CyclicalFeatureEncoder())
+        ('cyclical_encoding', CyclicalFeatureEncoder()),
+        ('location_encoding', LocationEncoder())
     ])
     
-    # Function to apply custom preprocessing and identify features for final pipeline
+    # Function to apply custom preprocessing and handle remaining NaNs
     def custom_preprocessor(X, y=None):
-        # Apply initial preprocessing
+        # Apply preprocessing pipeline
         X_processed = preprocessing_pipeline.fit_transform(X, y)
         
-        # Identify feature groups in processed data
+        # Final check for any remaining NaNs (feature engineering might create new NaNs)
+        if isinstance(X_processed, pd.DataFrame) and X_processed.isna().any().any():
+            # Get all column names
+            all_cols = X_processed.columns.tolist()
+            
+            # Apply a second round of imputation
+            final_imputer = SimpleImputer(strategy='median')
+            X_processed_values = final_imputer.fit_transform(X_processed)
+            X_processed = pd.DataFrame(
+                X_processed_values,
+                columns=all_cols,
+                index=X_processed.index
+            )
+        
         return X_processed
     
     # Define column transformer for final preprocessing
@@ -311,7 +375,6 @@ def get_estimator():
     # Create main pipeline
     pipe = Pipeline([
         ('preprocessing', final_transformer),
-        ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler()),
         ('classifier', GradientBoostingClassifier(
             n_estimators=200, 

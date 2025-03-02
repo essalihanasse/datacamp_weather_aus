@@ -28,7 +28,7 @@ score_types = [
 
 def get_cv(X, y):
     """Return cross-validation splits for training."""
-    cv = StratifiedShuffleSplit(n_splits=8, test_size=0.2, random_state=42)
+    cv = StratifiedShuffleSplit(n_splits=5, test_size=0.2, random_state=42)
     return cv.split(X, y)
 
 def _read_data(path, df_filename):
@@ -36,16 +36,8 @@ def _read_data(path, df_filename):
     data_path = os.path.join(path, 'data', df_filename)
     df = pd.read_csv(data_path)
     
-    # Process target column
-    # Map 'Yes' to 1 and 'No' to 0
-    target_mapping = {'No': 0, 'Yes': 1}
-    
-    if _target_column_name in df.columns:
-        y_array = df[_target_column_name].map(target_mapping).values
-        X_df = df.drop(_target_column_name, axis=1)
-    else:
-        y_array = None
-        X_df = df
+    y_array = df[_target_column_name]
+    X_df = df.drop(_target_column_name, axis=1)
     
     return X_df, y_array
 
