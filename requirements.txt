@@ -5,4 +5,5 @@ xgboost
 matplotlib
 seaborn
 plotly
+nbformat
 ramp-workflow
